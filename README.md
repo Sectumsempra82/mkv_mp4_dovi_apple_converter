@@ -33,37 +33,37 @@ This does **not** re-encode the video stream. It:
 brew install ffmpeg gpac
 ```
 
-#Linux (examples)
+### Linux (examples)
 
-Debian/Ubuntu:
+#### Debian/Ubuntu:
 ```
 sudo apt update && sudo apt install -y ffmpeg gpac
 ```
 
-Fedora:
+#### Fedora:
 ```
 sudo dnf install -y ffmpeg gpac
 ```
-Arch:
+#### Arch:
 ```
 sudo pacman -S ffmpeg gpac
 ```
-#Windows
+### Windows
 
 Pick one:
 
-Winget:
+#### Winget:
 ```
 winget install Gyan.FFmpeg
 winget install GPAC.GPAC
 ```
 
-Chocolatey:
+##### Chocolatey:
 ```
 choco install ffmpeg gpac
 ```
 
-Scoop:
+##### Scoop:
 ```
 scoop install ffmpeg gpac
 ```
