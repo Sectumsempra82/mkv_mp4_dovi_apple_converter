@@ -13,6 +13,7 @@ This does **not** re-encode the video stream. It:
 7) processes one file at a time,
 8) skips files when output already exists,
 9) skips MKVs that are not Dolby Vision.
+10) copies over any SRT/SubRip, WebVTT, sometimes ASS/SSA subtitles converting them to a proper format supported by QuickTime and Apple TV, PGS/VobSub subtitles are not supported as of now.
 
 ## Why this exists
 
