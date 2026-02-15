@@ -2,9 +2,9 @@
 """
 Batch convert Dolby Vision MKV -> Apple-friendly MP4 (Apple TV app / QuickTime DV)
 using:
-  - ffprobe: detect Dolby Vision + read first audio stream codec
-  - ffmpeg: extract HEVC (copy), copy original first audio stream to elementary file,
-            and always create AAC stereo fallback
+  - ffprobe: detect Dolby Vision + enumerate first audio + subtitle streams
+  - ffmpeg: extract HEVC (copy), copy original first audio stream (no re-encode) when possible,
+            always create AAC stereo fallback, convert each supported subtitle stream to mov_text (tx3g) inside MP4
   - MP4Box: mux (keeps DV signaling reliably)
 
 Behavior:
@@ -16,10 +16,19 @@ Behavior:
 
 Audio behavior (first audio stream only):
   - Always produce AAC stereo fallback from the first audio stream.
-  - Always also try to copy the original first audio stream to an elementary file (no re-encode).
+  - Also try to copy original first audio stream to an elementary file (no re-encode).
   - Track ordering:
-      * If source codec is eac3 or ac3: original surround is audio track #1, AAC stereo is track #2
-      * Otherwise: AAC stereo is audio track #1, original copied track is track #2
+      * If source codec is eac3 or ac3 and copy succeeded: original is audio #1, AAC stereo is audio #2
+      * Otherwise: AAC stereo is audio #1, original copied track is audio #2 (if copy succeeded)
+
+Subtitles:
+  - For each subtitle stream:
+      * If text-based and convertible (SubRip/SRT, WebVTT, ASS/SSA, mov_text, TTML):
+          convert to a tiny MP4 containing a single mov_text (tx3g) subtitle track:
+            ffmpeg -map 0:s:N -c:s mov_text subN.mp4
+          then MP4Box adds subN.mp4 (Apple TV / QuickTime compatible, selectable per track)
+      * If image-based (PGS/VobSub/DVD):
+          skipped (not supported yet)
 """
 
 from __future__ import annotations
@@ -170,6 +179,14 @@ class AudioStreamInfo:
     codec_name: str
 
 
+@dataclass(frozen=True)
+class SubtitleStreamInfo:
+    stream_index: int  # ffprobe absolute stream index
+    codec_name: str
+    language: str
+    title: str
+
+
 def first_audio_stream(tool: Tooling, src: Path) -> Optional[AudioStreamInfo]:
     data = ffprobe_json(tool, src)
     audio_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
@@ -183,6 +200,22 @@ def first_audio_stream(tool: Tooling, src: Path) -> Optional[AudioStreamInfo]:
     return AudioStreamInfo(stream_index=int(idx), codec_name=str(codec).lower())
 
 
+def subtitle_streams(tool: Tooling, src: Path) -> list[SubtitleStreamInfo]:
+    data = ffprobe_json(tool, src)
+    subs: list[SubtitleStreamInfo] = []
+    for s in data.get("streams", []):
+        if s.get("codec_type") != "subtitle":
+            continue
+        idx = s.get("index")
+        codec = (s.get("codec_name") or "").lower()
+        tags = s.get("tags") or {}
+        lang = (tags.get("language") or "und").lower()
+        title = str(tags.get("title") or "").strip()
+        if isinstance(idx, int) and codec:
+            subs.append(SubtitleStreamInfo(stream_index=int(idx), codec_name=codec, language=lang, title=title))
+    return subs
+
+
 def iter_input_files(folder: Path) -> Iterable[Path]:
     for ext in (".mkv", ".MKV"):
         yield from folder.glob(f"*{ext}")
@@ -193,8 +226,6 @@ def output_path_for(src: Path) -> Path:
 
 
 def _copied_audio_extension(codec_name: str) -> str:
-    # Elementary file extension used for MP4Box -add. ffmpeg can emit these.
-    # Keep it simple and predictable.
     if codec_name == "eac3":
         return "eac3"
     if codec_name == "ac3":
@@ -211,8 +242,87 @@ def _copied_audio_extension(codec_name: str) -> str:
         return "truehd"
     if codec_name == "dts":
         return "dts"
-    # Fallback: use the codec name as extension
     return codec_name or "audio"
+
+
+_TEXT_SUB_CODECS = {
+    # common text-based
+    "subrip",   # srt
+    "srt",
+    "webvtt",
+    "ass",
+    "ssa",
+    # mp4 text
+    "mov_text",
+    # some text-y variants
+    "text",
+    "ttml",
+}
+
+_IMAGE_SUB_CODECS = {
+    "hdmv_pgs_subtitle",
+    "pgs",
+    "dvd_subtitle",
+    "vobsub",
+}
+
+
+def _sanitize_lang(lang: str) -> str:
+    l = (lang or "und").strip().lower()
+    return l if l else "und"
+
+
+def extract_subtitles_to_tx3g_mp4(
+    tool: Tooling,
+    src: Path,
+    subs: list[SubtitleStreamInfo],
+    tmp_dir: Path,
+) -> list[tuple[Path, str]]:
+    """
+    For each supported text subtitle stream, create a tiny MP4 containing a single mov_text subtitle track.
+    Returns list of (mp4_path, lang) to be added to MP4Box.
+    """
+    extracted: list[tuple[Path, str]] = []
+
+    for i, s in enumerate(subs):
+        lang = _sanitize_lang(s.language)
+
+        if s.codec_name in _IMAGE_SUB_CODECS:
+            print(f"INFO: skipping image-based subtitle stream {s.stream_index} ({s.codec_name}, {lang})")
+            continue
+
+        if s.codec_name not in _TEXT_SUB_CODECS:
+            print(f"INFO: skipping unsupported subtitle codec stream {s.stream_index} ({s.codec_name}, {lang})")
+            continue
+
+        out_mp4 = tmp_dir / f"sub_{i}_{lang}.mp4"
+
+        res = run_cmd(
+            [
+                tool.ffmpeg,
+                "-hide_banner",
+                "-y",
+                "-i",
+                str(src),
+                "-map",
+                f"0:{s.stream_index}",
+                "-c:s",
+                "mov_text",
+                str(out_mp4),
+            ]
+        )
+
+        if res.returncode == 0 and out_mp4.exists() and out_mp4.stat().st_size > 0:
+            extracted.append((out_mp4, lang))
+            title_hint = f", title='{s.title}'" if s.title else ""
+            print(f"INFO: subtitle {s.stream_index} ({s.codec_name}, {lang}{title_hint}) -> {out_mp4.name}")
+        else:
+            print(
+                f"WARN: failed to convert subtitle stream {s.stream_index} ({s.codec_name}, {lang}); skipping.\n"
+                f"ffmpeg error:\n{res.stderr.strip()}\n"
+            )
+
+    return extracted
 
 
 def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
@@ -222,6 +332,7 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
         video_hevc: Path = tmp_dir / "video.hevc"
         audio_stereo_m4a: Optional[Path] = None
         audio_original: Optional[Path] = None
+        a0: Optional[AudioStreamInfo] = None
         out_tmp: Path = tmp_dir / "out.mp4"
 
         # 1) Extract HEVC elementary stream (no re-encode)
@@ -272,8 +383,7 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
                 context=f"[ffmpeg] creating AAC stereo fallback from audio stream {a0.stream_index} ({a0.codec_name})",
             )
 
-            # 2b) Also try to copy original first audio track (no re-encode)
-            # Even if Apple can't play it, user asked to include it as second track in those cases.
+            # 2b) Copy original first audio track (no re-encode) if possible
             ext = _copied_audio_extension(a0.codec_name)
             audio_original = tmp_dir / f"audio_original.{ext}"
             res = run_cmd(
@@ -297,15 +407,21 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
                 )
                 audio_original = None
 
-        # 3) Mux with MP4Box.
-        # Track order rule:
+        # 3) Subtitles: convert all supported text subs to tx3g-in-mp4 and add each
+        subs = subtitle_streams(tool, src)
+        extracted_subs = extract_subtitles_to_tx3g_mp4(tool, src, subs, tmp_dir)
+
+        # 4) Mux with MP4Box.
+        # Audio track order rule:
         #   - if original codec is eac3/ac3 and copy succeeded -> original first, AAC stereo second
         #   - otherwise -> AAC stereo first, original second (if available)
         mp4box_args: list[str] = [tool.mp4box, "-add", str(video_hevc)]
 
-        prefer_original_first = False
-        if a0 is not None and audio_original is not None and a0.codec_name in ("eac3", "ac3"):
-            prefer_original_first = True
+        prefer_original_first = (
+            a0 is not None
+            and audio_original is not None
+            and a0.codec_name in ("eac3", "ac3")
+        )
 
         if prefer_original_first:
             mp4box_args += ["-add", str(audio_original)]
@@ -319,10 +435,12 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
                 mp4box_args += ["-add", str(audio_original)]
                 if a0 is not None:
                     print(f"INFO: audio order = AAC stereo first, original {a0.codec_name} second")
-                else:
-                    print("INFO: audio order = AAC stereo first, original second")
             elif audio_stereo_m4a is not None:
                 print("INFO: audio = AAC stereo only")
+
+        # Add subtitles after audio; set language so Apple UI labels them nicely
+        for (sub_mp4, lang) in extracted_subs:
+            mp4box_args += ["-add", f"{sub_mp4}:lang={lang}"]
 
         mp4box_args += ["-new", str(out_tmp)]
 
@@ -331,7 +449,7 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
             context=f"[MP4Box] muxing to MP4 for {src.name}",
         )
 
-        # 4) Move output into place
+        # 5) Move output into place
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists():
             raise RuntimeError(f"Refusing to overwrite existing output: {dst}")
