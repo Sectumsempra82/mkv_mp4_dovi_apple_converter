@@ -70,19 +70,19 @@ scoop install ffmpeg gpac
 
 After installing on Windows, open a new terminal so PATH updates apply.
 
-Usage
+## Usage
 
 Put the script in the folder containing your MKV files:
 ```
 batch_dovi_mp4box.py
 ```
 
-Run it:
+### Run it:
 ```
 python3 batch_dovi_mp4box.py
 ```
 
-Behavior
+### Behavior
 
 Input: *.mkv in the current folder
 
@@ -94,7 +94,7 @@ If the MKV does not contain Dolby Vision metadata, it is skipped
 
 Intermediate files are written to a temporary directory and discarded
 
-#Notes / Gotchas
+## Notes / Gotchas
 
 Audio: the script converts the first audio track to AAC (384k) to improve Apple compatibility.
 If the MKV has no audio track, it produces a video-only MP4.
@@ -105,7 +105,7 @@ Dolby Vision: this is aimed primarily at DV Profile 8 (and similar single-layer 
 
 Large files: no problem — the script processes one file at a time and does not load video into memory.
 
-#How to verify Dolby Vision is preserved
+## How to verify Dolby Vision is preserved
 
 After conversion:
 ```
@@ -116,6 +116,6 @@ Look for, in the video stream:
 side_data_type: "DOVI configuration record"
 ```
 
-#License
+# License
 
 MIT
