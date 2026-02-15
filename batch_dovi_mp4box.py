@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-Batch convert MKV -> Apple-friendly MP4 preserving Dolby Vision (DV Profile 8 etc.)
-via:
-  1) Extract HEVC elementary stream with ffmpeg (no video re-encode)
-  2) Convert first audio track to AAC M4A (Apple-friendly)
-  3) Mux with GPAC MP4Box (more reliable DV signaling than ffmpeg remux)
-  4) Discard intermediates (temp dir), process one file at a time
-Skips if output file already exists.
-Skips MKVs that do NOT contain Dolby Vision (checks via ffprobe for DOVI config record).
+Batch convert Dolby Vision MKV -> Apple-friendly MP4 (Apple TV app / QuickTime DV)
+using:
+  - ffprobe: detect Dolby Vision + read audio codec
+  - ffmpeg: extract HEVC (copy), optionally copy E-AC3/AC-3, and always create AAC stereo fallback
+  - MP4Box: mux (keeps DV signaling reliably)
 
-Cross-platform notes:
-- This script is pure Python, but REQUIRES external binaries:
-    - ffmpeg
-    - ffprobe (ships with ffmpeg)
-    - MP4Box (from GPAC)
-  pip alone cannot provide them reliably.
+Behavior:
+  - Processes *.mkv in current folder
+  - Skips if output .mp4 exists
+  - Skips if input has no Dolby Vision metadata
+  - Processes one file at a time
+  - Deletes intermediates (temp dir)
+
+Audio logic (first audio stream only):
+  - Always create AAC stereo (.m4a) from the first audio stream
+  - If first audio codec is eac3 -> also copy that track to .eac3
+  - Else if first audio codec is ac3 -> also copy that track to .ac3
+  - Else if first audio codec is any other codec -> do NOT copy it (Apple reliability)
+  - MP4Box mux order is ALWAYS:
+      1) video
+      2) AAC stereo (first audio track in MP4)
+      3) (optional) E-AC3/AC-3 surround copied from source (second audio track)
+This guarantees Apple apps pick the stereo track by default, while still preserving surround
+when it's a good, Apple-friendly format.
 """
 
 from __future__ import annotations
@@ -55,7 +64,6 @@ def _exe_name(base: str) -> str:
 
 def _install_hints() -> str:
     sysname: str = platform.system().lower()
-
     if sysname == "darwin":
         return "macOS:\n  brew install ffmpeg gpac\n"
     if sysname == "linux":
@@ -103,10 +111,7 @@ def ensure_tools_or_exit() -> Tooling:
         missing.append(mp4box_name)
 
     if missing:
-        print(
-            "ERROR: Missing required tool(s) in PATH: " + ", ".join(missing),
-            file=sys.stderr,
-        )
+        print("ERROR: Missing required tool(s) in PATH: " + ", ".join(missing), file=sys.stderr)
         print("\nInstall instructions:\n" + _install_hints(), file=sys.stderr)
         sys.exit(2)
 
@@ -134,17 +139,7 @@ def run_cmd_or_raise(args: Sequence[str], context: str) -> None:
         )
 
 
-def iter_input_files(folder: Path) -> Iterable[Path]:
-    for ext in (".mkv", ".MKV"):
-        yield from folder.glob(f"*{ext}")
-
-
-def output_path_for(src: Path) -> Path:
-    return src.with_suffix(".mp4")
-
-
-def has_dovi(tool: Tooling, src: Path) -> bool:
-    # True if any video stream exposes "DOVI configuration record"
+def ffprobe_json(tool: Tooling, src: Path) -> dict:
     res: RunResult = run_cmd(
         [
             tool.ffprobe,
@@ -158,13 +153,13 @@ def has_dovi(tool: Tooling, src: Path) -> bool:
         ]
     )
     if res.returncode != 0:
-        raise RuntimeError(
-            f"[ffprobe] failed on {src.name}\n\nSTDERR:\n{res.stderr}\n"
-        )
+        raise RuntimeError(f"[ffprobe] failed on {src.name}\n\nSTDERR:\n{res.stderr}\n")
+    return json.loads(res.stdout or "{}")
 
-    data = json.loads(res.stdout or "{}")
-    streams = data.get("streams", [])
-    for s in streams:
+
+def has_dovi(tool: Tooling, src: Path) -> bool:
+    data = ffprobe_json(tool, src)
+    for s in data.get("streams", []):
         if s.get("codec_type") != "video":
             continue
         for sd in (s.get("side_data_list") or []):
@@ -173,12 +168,41 @@ def has_dovi(tool: Tooling, src: Path) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class AudioStreamInfo:
+    stream_index: int  # ffprobe absolute stream index (used as 0:<index>)
+    codec_name: str
+
+
+def first_audio_stream(tool: Tooling, src: Path) -> Optional[AudioStreamInfo]:
+    data = ffprobe_json(tool, src)
+    audio_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+    if not audio_streams:
+        return None
+    s0 = audio_streams[0]
+    idx = s0.get("index")
+    codec = s0.get("codec_name") or ""
+    if not isinstance(idx, int) or not codec:
+        return None
+    return AudioStreamInfo(stream_index=int(idx), codec_name=str(codec).lower())
+
+
+def iter_input_files(folder: Path) -> Iterable[Path]:
+    for ext in (".mkv", ".MKV"):
+        yield from folder.glob(f"*{ext}")
+
+
+def output_path_for(src: Path) -> Path:
+    return src.with_suffix(".mp4")
+
+
 def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="dovi_mp4box_") as tmp_dir_str:
         tmp_dir: Path = Path(tmp_dir_str)
 
         video_hevc: Path = tmp_dir / "video.hevc"
-        audio_m4a: Path = tmp_dir / "audio.m4a"
+        audio_stereo_m4a: Path = tmp_dir / "audio_stereo.m4a"
+        audio_surround: Optional[Path] = None
         out_tmp: Path = tmp_dir / "out.mp4"
 
         # 1) Extract HEVC elementary stream (no re-encode)
@@ -202,33 +226,85 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
             context=f"[ffmpeg] extracting video from {src.name}",
         )
 
-        # 2) Convert first audio stream to AAC/M4A for Apple compatibility.
-        # If there's no audio stream, continue video-only.
-        have_audio: bool = True
-        audio_res: RunResult = run_cmd(
-            [
-                tool.ffmpeg,
-                "-hide_banner",
-                "-y",
-                "-i",
-                str(src),
-                "-map",
-                "0:a:0",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "384k",
-                str(audio_m4a),
-            ]
-        )
-        if audio_res.returncode != 0:
-            have_audio = False
+        # 2) Audio: use FIRST audio stream only
+        a0 = first_audio_stream(tool, src)
+        if a0 is None:
+            print("WARN: no audio streams found; output will be video-only")
+            have_stereo = False
+        else:
+            # 2a) Always create AAC stereo fallback (this will be the FIRST audio track in MP4)
+            run_cmd_or_raise(
+                [
+                    tool.ffmpeg,
+                    "-hide_banner",
+                    "-y",
+                    "-i",
+                    str(src),
+                    "-map",
+                    f"0:{a0.stream_index}",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "256k",
+                    "-ac",
+                    "2",
+                    str(audio_stereo_m4a),
+                ],
+                context=f"[ffmpeg] creating AAC stereo fallback from audio stream {a0.stream_index} ({a0.codec_name})",
+            )
+            have_stereo = True
 
-        # 3) Mux with MP4Box
-        mp4box_args: list[str] = [tool.mp4box]
-        mp4box_args += ["-add", str(video_hevc)]
-        if have_audio:
-            mp4box_args += ["-add", str(audio_m4a)]
+            # 2b) If E-AC3 or AC-3, also copy it (surround track as SECOND audio track)
+            if a0.codec_name == "eac3":
+                audio_surround = tmp_dir / "audio_surround.eac3"
+                run_cmd_or_raise(
+                    [
+                        tool.ffmpeg,
+                        "-hide_banner",
+                        "-y",
+                        "-i",
+                        str(src),
+                        "-map",
+                        f"0:{a0.stream_index}",
+                        "-c:a",
+                        "copy",
+                        str(audio_surround),
+                    ],
+                    context=f"[ffmpeg] copying E-AC3 surround audio stream {a0.stream_index}",
+                )
+                print("INFO: preserved surround as E-AC3 (second audio track)")
+            elif a0.codec_name == "ac3":
+                audio_surround = tmp_dir / "audio_surround.ac3"
+                run_cmd_or_raise(
+                    [
+                        tool.ffmpeg,
+                        "-hide_banner",
+                        "-y",
+                        "-i",
+                        str(src),
+                        "-map",
+                        f"0:{a0.stream_index}",
+                        "-c:a",
+                        "copy",
+                        str(audio_surround),
+                    ],
+                    context=f"[ffmpeg] copying AC-3 surround audio stream {a0.stream_index}",
+                )
+                print("INFO: preserved surround as AC-3 (second audio track)")
+            else:
+                # Do not copy other codecs (DTS/TrueHD/FLAC/Opus/AAC multichannel etc.)
+                print(f"INFO: source audio codec '{a0.codec_name}' not copied (Apple reliability). Using AAC stereo only.")
+
+        # 3) Mux with MP4Box.
+        # Order matters: video first, then AAC stereo, then surround (if any).
+        mp4box_args: list[str] = [tool.mp4box, "-add", str(video_hevc)]
+
+        if have_stereo:
+            mp4box_args += ["-add", str(audio_stereo_m4a)]
+
+        if audio_surround is not None and audio_surround.exists() and audio_surround.stat().st_size > 0:
+            mp4box_args += ["-add", str(audio_surround)]
+
         mp4box_args += ["-new", str(out_tmp)]
 
         run_cmd_or_raise(
@@ -240,7 +316,6 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists():
             raise RuntimeError(f"Refusing to overwrite existing output: {dst}")
-
         out_tmp.replace(dst)
 
 
@@ -261,7 +336,7 @@ def main() -> int:
     for src in inputs:
         dst: Path = output_path_for(src)
         if dst.exists():
-            print(f"SKIP: {src.name} -> {dst.name} (already exists)")
+            print(f"SKIP:  {src.name} -> {dst.name} (already exists)")
             skipped_exists += 1
             continue
 
