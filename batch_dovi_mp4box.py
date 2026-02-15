@@ -2,8 +2,9 @@
 """
 Batch convert Dolby Vision MKV -> Apple-friendly MP4 (Apple TV app / QuickTime DV)
 using:
-  - ffprobe: detect Dolby Vision + read audio codec
-  - ffmpeg: extract HEVC (copy), optionally copy E-AC3/AC-3, and always create AAC stereo fallback
+  - ffprobe: detect Dolby Vision + read first audio stream codec
+  - ffmpeg: extract HEVC (copy), copy original first audio stream to elementary file,
+            and always create AAC stereo fallback
   - MP4Box: mux (keeps DV signaling reliably)
 
 Behavior:
@@ -13,17 +14,12 @@ Behavior:
   - Processes one file at a time
   - Deletes intermediates (temp dir)
 
-Audio logic (first audio stream only):
-  - Always create AAC stereo (.m4a) from the first audio stream
-  - If first audio codec is eac3 -> also copy that track to .eac3
-  - Else if first audio codec is ac3 -> also copy that track to .ac3
-  - Else if first audio codec is any other codec -> do NOT copy it (Apple reliability)
-  - MP4Box mux order is ALWAYS:
-      1) video
-      2) AAC stereo (first audio track in MP4)
-      3) (optional) E-AC3/AC-3 surround copied from source (second audio track)
-This guarantees Apple apps pick the stereo track by default, while still preserving surround
-when it's a good, Apple-friendly format.
+Audio behavior (first audio stream only):
+  - Always produce AAC stereo fallback from the first audio stream.
+  - Always also try to copy the original first audio stream to an elementary file (no re-encode).
+  - Track ordering:
+      * If source codec is eac3 or ac3: original surround is audio track #1, AAC stereo is track #2
+      * Otherwise: AAC stereo is audio track #1, original copied track is track #2
 """
 
 from __future__ import annotations
@@ -196,13 +192,36 @@ def output_path_for(src: Path) -> Path:
     return src.with_suffix(".mp4")
 
 
+def _copied_audio_extension(codec_name: str) -> str:
+    # Elementary file extension used for MP4Box -add. ffmpeg can emit these.
+    # Keep it simple and predictable.
+    if codec_name == "eac3":
+        return "eac3"
+    if codec_name == "ac3":
+        return "ac3"
+    if codec_name == "aac":
+        return "aac"
+    if codec_name == "mp3":
+        return "mp3"
+    if codec_name == "opus":
+        return "opus"
+    if codec_name == "flac":
+        return "flac"
+    if codec_name in ("truehd", "mlp"):
+        return "truehd"
+    if codec_name == "dts":
+        return "dts"
+    # Fallback: use the codec name as extension
+    return codec_name or "audio"
+
+
 def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="dovi_mp4box_") as tmp_dir_str:
         tmp_dir: Path = Path(tmp_dir_str)
 
         video_hevc: Path = tmp_dir / "video.hevc"
-        audio_stereo_m4a: Path = tmp_dir / "audio_stereo.m4a"
-        audio_surround: Optional[Path] = None
+        audio_stereo_m4a: Optional[Path] = None
+        audio_original: Optional[Path] = None
         out_tmp: Path = tmp_dir / "out.mp4"
 
         # 1) Extract HEVC elementary stream (no re-encode)
@@ -226,13 +245,13 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
             context=f"[ffmpeg] extracting video from {src.name}",
         )
 
-        # 2) Audio: use FIRST audio stream only
+        # 2) Audio: first audio stream only
         a0 = first_audio_stream(tool, src)
         if a0 is None:
             print("WARN: no audio streams found; output will be video-only")
-            have_stereo = False
         else:
-            # 2a) Always create AAC stereo fallback (this will be the FIRST audio track in MP4)
+            # 2a) Always create AAC stereo fallback
+            audio_stereo_m4a = tmp_dir / "audio_stereo.m4a"
             run_cmd_or_raise(
                 [
                     tool.ffmpeg,
@@ -252,58 +271,58 @@ def convert_one(tool: Tooling, src: Path, dst: Path) -> None:
                 ],
                 context=f"[ffmpeg] creating AAC stereo fallback from audio stream {a0.stream_index} ({a0.codec_name})",
             )
-            have_stereo = True
 
-            # 2b) If E-AC3 or AC-3, also copy it (surround track as SECOND audio track)
-            if a0.codec_name == "eac3":
-                audio_surround = tmp_dir / "audio_surround.eac3"
-                run_cmd_or_raise(
-                    [
-                        tool.ffmpeg,
-                        "-hide_banner",
-                        "-y",
-                        "-i",
-                        str(src),
-                        "-map",
-                        f"0:{a0.stream_index}",
-                        "-c:a",
-                        "copy",
-                        str(audio_surround),
-                    ],
-                    context=f"[ffmpeg] copying E-AC3 surround audio stream {a0.stream_index}",
+            # 2b) Also try to copy original first audio track (no re-encode)
+            # Even if Apple can't play it, user asked to include it as second track in those cases.
+            ext = _copied_audio_extension(a0.codec_name)
+            audio_original = tmp_dir / f"audio_original.{ext}"
+            res = run_cmd(
+                [
+                    tool.ffmpeg,
+                    "-hide_banner",
+                    "-y",
+                    "-i",
+                    str(src),
+                    "-map",
+                    f"0:{a0.stream_index}",
+                    "-c:a",
+                    "copy",
+                    str(audio_original),
+                ]
+            )
+            if res.returncode != 0 or not audio_original.exists() or audio_original.stat().st_size == 0:
+                print(
+                    "WARN: could not copy original audio track; keeping only AAC stereo.\n"
+                    f"ffmpeg error:\n{res.stderr.strip()}\n"
                 )
-                print("INFO: preserved surround as E-AC3 (second audio track)")
-            elif a0.codec_name == "ac3":
-                audio_surround = tmp_dir / "audio_surround.ac3"
-                run_cmd_or_raise(
-                    [
-                        tool.ffmpeg,
-                        "-hide_banner",
-                        "-y",
-                        "-i",
-                        str(src),
-                        "-map",
-                        f"0:{a0.stream_index}",
-                        "-c:a",
-                        "copy",
-                        str(audio_surround),
-                    ],
-                    context=f"[ffmpeg] copying AC-3 surround audio stream {a0.stream_index}",
-                )
-                print("INFO: preserved surround as AC-3 (second audio track)")
-            else:
-                # Do not copy other codecs (DTS/TrueHD/FLAC/Opus/AAC multichannel etc.)
-                print(f"INFO: source audio codec '{a0.codec_name}' not copied (Apple reliability). Using AAC stereo only.")
+                audio_original = None
 
         # 3) Mux with MP4Box.
-        # Order matters: video first, then AAC stereo, then surround (if any).
+        # Track order rule:
+        #   - if original codec is eac3/ac3 and copy succeeded -> original first, AAC stereo second
+        #   - otherwise -> AAC stereo first, original second (if available)
         mp4box_args: list[str] = [tool.mp4box, "-add", str(video_hevc)]
 
-        if have_stereo:
-            mp4box_args += ["-add", str(audio_stereo_m4a)]
+        prefer_original_first = False
+        if a0 is not None and audio_original is not None and a0.codec_name in ("eac3", "ac3"):
+            prefer_original_first = True
 
-        if audio_surround is not None and audio_surround.exists() and audio_surround.stat().st_size > 0:
-            mp4box_args += ["-add", str(audio_surround)]
+        if prefer_original_first:
+            mp4box_args += ["-add", str(audio_original)]
+            if audio_stereo_m4a is not None:
+                mp4box_args += ["-add", str(audio_stereo_m4a)]
+            print(f"INFO: audio order = original {a0.codec_name} first, AAC stereo second")
+        else:
+            if audio_stereo_m4a is not None:
+                mp4box_args += ["-add", str(audio_stereo_m4a)]
+            if audio_original is not None:
+                mp4box_args += ["-add", str(audio_original)]
+                if a0 is not None:
+                    print(f"INFO: audio order = AAC stereo first, original {a0.codec_name} second")
+                else:
+                    print("INFO: audio order = AAC stereo first, original second")
+            elif audio_stereo_m4a is not None:
+                print("INFO: audio = AAC stereo only")
 
         mp4box_args += ["-new", str(out_tmp)]
 
